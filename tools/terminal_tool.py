@@ -39,6 +39,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -1573,12 +1574,74 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
     re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE),
     re.compile(r"\bnext\s+dev\b", re.IGNORECASE),
-    re.compile(r"\bvite(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bnodemon\b", re.IGNORECASE),
     re.compile(r"\buvicorn\b", re.IGNORECASE),
     re.compile(r"\bgunicorn\b", re.IGNORECASE),
     re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
 )
+
+
+def _split_shell_command_for_classifier(command: str) -> list[str]:
+    """Best-effort tokenization for foreground/background heuristics."""
+    try:
+        return shlex.split(command, posix=platform.system() != "Windows")
+    except ValueError:
+        return []
+
+
+def _strip_leading_env_assignments(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens) and _looks_like_env_assignment(tokens[index]):
+        index += 1
+    return tokens[index:]
+
+
+def _command_basename(token: str) -> str:
+    return Path(token).name.lower()
+
+
+def _extract_vite_arguments(command: str) -> list[str] | None:
+    """Return tokens after the invoked Vite executable, if present."""
+    tokens = _strip_leading_env_assignments(_split_shell_command_for_classifier(command))
+    if not tokens:
+        return None
+
+    first = _command_basename(tokens[0])
+    if first == "vite":
+        return tokens[1:]
+
+    if first in {"npx", "pnpx", "bunx"} and len(tokens) >= 2 and _command_basename(tokens[1]) == "vite":
+        return tokens[2:]
+
+    if first == "npm" and len(tokens) >= 3 and tokens[1].lower() in {"exec", "x"} and _command_basename(tokens[2]) == "vite":
+        return tokens[3:]
+
+    if first in {"pnpm", "yarn", "bun"}:
+        if len(tokens) >= 3 and tokens[1].lower() in {"exec", "dlx"} and _command_basename(tokens[2]) == "vite":
+            return tokens[3:]
+        if len(tokens) >= 2 and _command_basename(tokens[1]) == "vite":
+            return tokens[2:]
+
+    return None
+
+
+def _looks_like_vite_long_lived_command(command: str) -> bool:
+    """Classify Vite invocations by subcommand instead of matching bare `vite`."""
+    vite_args = _extract_vite_arguments(command)
+    if vite_args is None:
+        return False
+
+    subcommands = [token.lower() for token in vite_args if not token.startswith("-")]
+    if not subcommands:
+        return True
+
+    first_subcommand = subcommands[0]
+    if first_subcommand in {"dev", "serve", "preview"}:
+        return True
+    if first_subcommand in {"build", "optimize"}:
+        return False
+
+    return False
 
 
 def _looks_like_help_or_version_command(command: str) -> bool:
@@ -1616,6 +1679,13 @@ def _foreground_background_guidance(command: str) -> str | None:
         return (
             "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
             "processes, then run health checks and tests in follow-up terminal calls."
+        )
+
+    if _looks_like_vite_long_lived_command(unquoted):
+        return (
+            "This foreground command appears to start a long-lived server/watch process. "
+            "Run it with background=true, verify readiness (health endpoint/log signal), "
+            "then execute tests in a separate command."
         )
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
